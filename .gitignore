@@ -1,0 +1,28 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+
+# YOLO downloads & training outputs
+yolov8*.pt
+runs/
+weights/
+
+# EasyOCR model cache (optional local)
+.EasyOCR/
+
+# Local test media & results
+test_car.jpg
+output_result.jpg
+*.mp4
+
+# Dataset images (keep data.yaml template only if you want)
+dataset/train/
+dataset/valid/
+dataset/test/
+dataset/**/*.jpg
+dataset/**/*.jpeg
+dataset/**/*.png
+dataset/**/*.txt
+!dataset/data.yaml

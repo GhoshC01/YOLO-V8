@@ -1,0 +1,7 @@
+path: /Users/rajibghosh/developer/DEVFLOWW/car-number-plate-detector/YoLoV8/dataset
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: ['indian_licence_plate']

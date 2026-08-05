@@ -1,0 +1,13 @@
+ultralytics
+easyocr
+opencv-python
+numpy
+paddlepaddle
+paddleocr
+
+# API
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+pillow-heif

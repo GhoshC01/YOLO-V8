@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Number Plate Detector</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #141b30;
+    --panel-2: #1b2440;
+    --border: #263154;
+    --text: #e8ecf8;
+    --muted: #93a0c4;
+    --accent: #4ade80;
+    --accent-2: #38bdf8;
+    --danger: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 20% -10%, #1c2748 0%, var(--bg) 60%);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 20px 80px; }
+  header { margin-bottom: 28px; }
+  h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.3px; }
+  .sub { color: var(--muted); font-size: 14px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+    margin-bottom: 20px;
+  }
+  #drop {
+    border: 2px dashed var(--border);
+    border-radius: 14px;
+    padding: 44px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .18s, background .18s;
+    background: var(--panel-2);
+  }
+  #drop:hover, #drop.over { border-color: var(--accent); background: #1e2a49; }
+  #drop .big { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  #drop .small { color: var(--muted); font-size: 13px; }
+  input[type=file] { display: none; }
+  .opts { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 20px; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  select, input[type=number] {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 9px;
+    padding: 9px 11px;
+    font-size: 14px;
+    min-width: 120px;
+  }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+  .check input { accent-color: var(--accent); width: 16px; height: 16px; }
+  button {
+    background: linear-gradient(180deg, var(--accent) 0%, #22c55e 100%);
+    color: #052e16;
+    border: 0;
+    border-radius: 10px;
+    padding: 12px 22px;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .files { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .result {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    margin-bottom: 18px;
+  }
+  .result img { width: 100%; display: block; background: #000; }
+  .result .body { padding: 16px 18px; }
+  .plate {
+    display: inline-block;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    background: #052e16;
+    color: var(--accent);
+    border: 1px solid #166534;
+    border-radius: 8px;
+    padding: 7px 14px;
+    margin: 4px 8px 4px 0;
+  }
+  .plate.invalid { background: #3f1d1d; color: var(--danger); border-color: #7f1d1d; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .fname { font-weight: 600; margin-bottom: 10px; word-break: break-all; }
+  .none { color: var(--danger); font-size: 14px; }
+  .spin { color: var(--accent-2); font-size: 14px; }
+  code { background: var(--panel-2); padding: 2px 6px; border-radius: 5px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Number Plate Detector</h1>
+    <div class="sub">YOLOv8 + PaddleOCR &middot; JPG, PNG, WebP, BMP, TIFF, HEIC সব চলবে</div>
+  </header>
+
+  <div class="card">
+    <div id="drop">
+      <div class="big">ছবি এখানে ড্রপ করুন বা ক্লিক করে সিলেক্ট করুন</div>
+      <div class="small">একসাথে একাধিক ছবি দিতে পারবেন &middot; সর্বোচ্চ 25 MB প্রতি ছবি</div>
+    </div>
+    <input id="picker" type="file" accept="image/*,.heic,.heif" multiple />
+    <div class="files" id="filelist"></div>
+
+    <div class="opts">
+      <div class="field">
+        <label for="ocr">OCR engine</label>
+        <select id="ocr">
+          <option value="paddle" selected>PaddleOCR</option>
+          <option value="easy">EasyOCR</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="conf">Confidence</label>
+        <input id="conf" type="number" step="0.05" min="0.01" max="0.95" value="0.25" />
+      </div>
+      <div class="field">
+        <label for="imgsz">Image size</label>
+        <select id="imgsz">
+          <option value="640">640 (fast)</option>
+          <option value="1280" selected>1280 (balanced)</option>
+          <option value="1600">1600 (small plates)</option>
+        </select>
+      </div>
+      <label class="check"><input id="invalid" type="checkbox" /> Show non-plate matches</label>
+      <button id="go" disabled>Detect Plates</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+  <div id="results"></div>
+</div>
+
+<script>
+  const drop = document.getElementById('drop');
+  const picker = document.getElementById('picker');
+  const filelist = document.getElementById('filelist');
+  const go = document.getElementById('go');
+  const statusBox = document.getElementById('status');
+  const results = document.getElementById('results');
+  let files = [];
+
+  function setFiles(list) {
+    files = Array.from(list);
+    go.disabled = files.length === 0;
+    filelist.textContent = files.length
+      ? `${files.length} file(s): ` + files.map(f => f.name).join(', ')
+      : '';
+  }
+
+  drop.addEventListener('click', () => picker.click());
+  picker.addEventListener('change', e => setFiles(e.target.files));
+
+  ['dragenter', 'dragover'].forEach(ev =>
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); })
+  );
+  ['dragleave', 'drop'].forEach(ev =>
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); })
+  );
+  drop.addEventListener('drop', e => setFiles(e.dataTransfer.files));
+
+  go.addEventListener('click', async () => {
+    if (!files.length) return;
+
+    const body = new FormData();
+    files.forEach(f => body.append('files', f));
+    body.append('ocr', document.getElementById('ocr').value);
+    body.append('conf', document.getElementById('conf').value);
+    body.append('imgsz', document.getElementById('imgsz').value);
+    body.append('include_invalid', document.getElementById('invalid').checked);
+    body.append('annotate', 'true');
+
+    go.disabled = true;
+    results.innerHTML = '';
+    statusBox.innerHTML = '<div class="card spin">Processing… প্রথমবার মডেল লোড হতে কিছুটা সময় লাগতে পারে।</div>';
+
+    try {
+      const res = await fetch('/detect', { method: 'POST', body });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Request failed');
+      }
+      const data = await res.json();
+      statusBox.innerHTML = '';
+      results.innerHTML = data.results.map(render).join('');
+    } catch (err) {
+      statusBox.innerHTML = `<div class="card none">Error: ${err.message}</div>`;
+    } finally {
+      go.disabled = false;
+    }
+  });
+
+  function render(r) {
+    const plates = r.plates.length
+      ? r.plates.map(p =>
+          `<span class="plate ${p.valid_format ? '' : 'invalid'}">${p.text || '—'}</span>`
+        ).join('')
+      : '<div class="none">কোনো নম্বর প্লেট পাওয়া যায়নি। Confidence কমিয়ে বা Image size বাড়িয়ে দেখুন।</div>';
+
+    const conf = r.plates.length
+      ? r.plates.map(p => `${p.text}: ${(p.confidence * 100).toFixed(0)}%`).join(' · ')
+      : '';
+
+    return `
+      <div class="result">
+        ${r.annotated_image ? `<img src="${r.annotated_image}" alt="result" />` : ''}
+        <div class="body">
+          <div class="fname">${r.filename}</div>
+          ${plates}
+          <div class="meta">
+            ${r.width}×${r.height} px · ${r.plate_count} plate(s) · ${r.processing_ms} ms
+            ${conf ? '<br>Detection confidence — ' + conf : ''}
+          </div>
+        </div>
+      </div>`;
+  }
+</script>
+</body>
+</html>
