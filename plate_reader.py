@@ -11,9 +11,23 @@ from ultralytics import YOLO
 DEFAULT_MODEL = "runs/detect/my_plate_model-2/weights/best.pt"
 DEFAULT_CONF = 0.25
 DEFAULT_IMGSZ = 1280
+OCR_ENGINES = ("paddle", "easy", "rapid")
 
 PLATE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 PLATE_PATTERN = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$")
+
+CROP_SIDE_PAD = 0.12
+CROP_RIGHT_EXTRA = 0.18
+MIN_CROP_PAD_PX = 10
+MIN_CROP_HEIGHT = 40
+MIN_CROP_WIDTH = 120
+CROP_BORDER_RATIO = 0.06
+DETECT_IMGSZ_SET = (640, 1280, 1600)
+JUNK_OCR = re.compile(
+    r"(GPS|GITUDE|NGITUDE|LONGIT|LATITUD|CHANNEL|TIMESTAMP|HTTP|WWW|INDIA)",
+    re.I,
+)
+DIGIT_HEAVY = re.compile(r"^\d{6,}$")
 
 _lock = threading.Lock()
 _detectors = {}
@@ -30,6 +44,9 @@ def get_detector(model_path=DEFAULT_MODEL):
 
 def get_ocr(engine="paddle"):
     """Load the OCR engine once per process."""
+    if engine not in OCR_ENGINES:
+        raise ValueError(f"Unknown OCR engine: {engine}. Choose from {OCR_ENGINES}.")
+
     with _lock:
         if engine in _ocr_engines:
             return _ocr_engines[engine]
@@ -45,6 +62,10 @@ def get_ocr(engine="paddle"):
             import easyocr
 
             ocr = easyocr.Reader(["en"], gpu=False)
+        elif engine == "rapid":
+            from rapidocr import RapidOCR
+
+            ocr = RapidOCR()
         else:
             raise ValueError(f"Unknown OCR engine: {engine}")
 
@@ -80,18 +101,36 @@ def decode_image(data):
 
 def clean_plate_text(text):
     """Keep only A-Z / 0-9 and return an uppercase plate string."""
-    return re.sub(r"[^A-Z0-9]", "", text.upper())
+    cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
+    # Camera plates often OCR the IND hologram strip as a prefix.
+    if cleaned.startswith("IND") and len(cleaned) > 8:
+        cleaned = cleaned[3:]
+    return cleaned
 
 
 def score_plate_text(text):
     """Prefer typical Indian plate length / pattern."""
     if not text:
         return -1
+    if JUNK_OCR.search(text) or DIGIT_HEAVY.match(text):
+        return -5
+    # GPS leftovers like UDE783320130000E / 1D7370200
+    digit_ratio = sum(ch.isdigit() for ch in text) / max(len(text), 1)
+    if digit_ratio > 0.7 and not PLATE_PATTERN.match(text):
+        return -3
+    if text.endswith(("E", "N", "W", "S")) and digit_ratio > 0.5:
+        return -4
+
     score = len(text)
     if 8 <= len(text) <= 11:
         score += 5
+    if 9 <= len(text) <= 10:
+        score += 3
     if PLATE_PATTERN.match(text):
-        score += 10
+        score += 20
+    # State-code start is a strong Indian-plate signal.
+    if re.match(r"^[A-Z]{2}\d", text):
+        score += 8
     return score
 
 
@@ -107,6 +146,262 @@ def enhance_plate(cropped_plate, scale=2):
     gray = cv2.bilateralFilter(gray, 7, 50, 50)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+
+
+def deskew_plate(crop):
+    """Rotate a skewed plate crop upright (handles angled CCTV views)."""
+    if crop is None or crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    if np.mean(thr) > 127:
+        thr = 255 - thr
+    coords = np.column_stack(np.where(thr > 0))
+    if len(coords) < 40:
+        return crop
+    angle = cv2.minAreaRect(coords.astype(np.float32))[-1]
+    if angle < -45:
+        angle = 90 + angle
+    if abs(angle) < 1.5 or abs(angle) > 40:
+        return crop
+    matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+    return cv2.warpAffine(
+        crop,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+def pad_box(
+    x1,
+    y1,
+    x2,
+    y2,
+    img_h,
+    img_w,
+    side_pad=CROP_SIDE_PAD,
+    right_extra=CROP_RIGHT_EXTRA,
+):
+    """Expand a YOLO box before OCR so edge characters are not cut off.
+
+    Close-up plates already fill most of the frame — use smaller absolute padding
+    so bumper lights / GPS text are not pulled into the OCR crop.
+    """
+    bw = max(x2 - x1, 1)
+    bh = max(y2 - y1, 1)
+    # Large boxes (close-ups): keep padding tiny. Small distant plates: keep % pad.
+    if bw >= 280:
+        left = top = bottom = 6
+        right = 14
+    else:
+        left = max(int(bw * side_pad), MIN_CROP_PAD_PX)
+        top = max(int(bh * side_pad), MIN_CROP_PAD_PX)
+        bottom = max(int(bh * side_pad), MIN_CROP_PAD_PX)
+        right = max(int(bw * (side_pad + right_extra)), MIN_CROP_PAD_PX + 2)
+    return (
+        max(0, x1 - left),
+        max(0, y1 - top),
+        min(img_w, x2 + right),
+        min(img_h, y2 + bottom),
+    )
+
+
+def extract_plate_crop(img, x1, y1, x2, y2, right_extra=CROP_RIGHT_EXTRA):
+    """Build an OCR-ready plate crop with padding, upscaling, and a soft border."""
+    img_h, img_w = img.shape[:2]
+    px1, py1, px2, py2 = pad_box(
+        x1, y1, x2, y2, img_h, img_w, right_extra=right_extra
+    )
+    crop = img[py1:py2, px1:px2]
+    if crop.size == 0:
+        return None, {"x1": px1, "y1": py1, "x2": px2, "y2": py2}
+
+    crop = crop.copy()
+    h, w = crop.shape[:2]
+    scale = max(MIN_CROP_HEIGHT / h, MIN_CROP_WIDTH / w, 1.0)
+    if scale > 1.0:
+        crop = cv2.resize(
+            crop,
+            (max(int(w * scale), 1), max(int(h * scale), 1)),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    border = max(4, int(min(crop.shape[:2]) * CROP_BORDER_RATIO))
+    crop = cv2.copyMakeBorder(
+        crop,
+        border,
+        border,
+        border,
+        border,
+        cv2.BORDER_CONSTANT,
+        value=(210, 210, 210),
+    )
+    return crop, {"x1": px1, "y1": py1, "x2": px2, "y2": py2}
+
+
+def _box_aspect(x1, y1, x2, y2):
+    return (x2 - x1) / max(y2 - y1, 1)
+
+
+def _looks_like_osd_box(x1, y1, x2, y2, img_h, img_w):
+    """Drop timestamp / GPS overlay boxes that YOLO often confuses as plates."""
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 20 or bh < 10:
+        return True
+    # Timestamp strip near the top edge
+    if y2 < img_h * 0.18 and _box_aspect(x1, y1, x2, y2) > 2.5:
+        return True
+    # Very bottom GPS caption band
+    if y1 > img_h * 0.78 and bh < img_h * 0.25:
+        return True
+    # Tiny relative to frame
+    if (bw * bh) < (img_w * img_h * 0.01):
+        return True
+    return False
+
+
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    return inter / max(area_a + area_b - inter, 1)
+
+
+def collect_detection_boxes(detector, img, conf, imgsz):
+    """Run YOLO at multiple sizes; keep overlaps so OCR can pick the true plate."""
+    img_h, img_w = img.shape[:2]
+    sizes = sorted({640, int(imgsz), 1280})
+    raw = []
+    for size in sizes:
+        for result in detector(img, conf=min(conf, 0.12), imgsz=size, verbose=False):
+            for box in result.boxes:
+                x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+                if _looks_like_osd_box(x1, y1, x2, y2, img_h, img_w):
+                    continue
+                raw.append((float(box.conf), x1, y1, x2, y2))
+
+    # Prefer plate-like geometry in the vehicle band (not bottom GPS strip).
+    def box_priority(item):
+        conf_i, x1, y1, x2, y2 = item
+        ar = _box_aspect(x1, y1, x2, y2)
+        cy = (y1 + y2) / 2.0 / img_h
+        aspect_score = 1.0 if 1.8 <= ar <= 6.0 else 0.2
+        band_score = 1.0 if 0.25 <= cy <= 0.85 else 0.3
+        return (aspect_score + band_score, conf_i)
+
+    raw.sort(key=box_priority, reverse=True)
+    kept = []
+    for cand in raw:
+        conf_i, x1, y1, x2, y2 = cand
+        # Soft NMS: only drop near-identical boxes so angled crops survive.
+        if any(_iou((x1, y1, x2, y2), (k[1], k[2], k[3], k[4])) > 0.75 for k in kept):
+            continue
+        kept.append(cand)
+        if len(kept) >= 8:
+            break
+    return kept
+
+
+def _mask_to_proposals(img, mask, score=0.34, max_boxes=3):
+    img_h, img_w = img.shape[:2]
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    proposals = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < 60 or h < 18:
+            continue
+        ar = w / max(h, 1)
+        if ar < 1.5 or ar > 8.0:
+            continue
+        if (w * h) < (img_w * img_h * 0.008):
+            continue
+        if _looks_like_osd_box(x, y, x + w, y + h, img_h, img_w):
+            continue
+        proposals.append((score, x, y, x + w, y + h))
+    proposals.sort(key=lambda b: (b[3] - b[1]) * (b[4] - b[2]), reverse=True)
+    return proposals[:max_boxes]
+
+
+def color_plate_proposals(img, max_boxes=4):
+    """Color heuristics for yellow (day/night) and white private plates at any angle."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    proposals = []
+    # Daytime yellow commercial plates
+    proposals.extend(
+        _mask_to_proposals(img, cv2.inRange(hsv, (15, 60, 60), (42, 255, 255)), 0.36)
+    )
+    # Low-light / night yellow (weaker saturation)
+    proposals.extend(
+        _mask_to_proposals(img, cv2.inRange(hsv, (12, 25, 40), (45, 255, 255)), 0.33)
+    )
+    # White / light private plates
+    proposals.extend(
+        _mask_to_proposals(img, cv2.inRange(hsv, (0, 0, 150), (180, 60, 255)), 0.32)
+    )
+
+    kept = []
+    for cand in proposals:
+        if any(_iou((cand[1], cand[2], cand[3], cand[4]), (k[1], k[2], k[3], k[4])) > 0.5 for k in kept):
+            continue
+        kept.append(cand)
+        if len(kept) >= max_boxes:
+            break
+    return kept
+
+
+def yellow_plate_proposals(img, max_boxes=3):
+    """Backward-compatible alias."""
+    return color_plate_proposals(img, max_boxes=max_boxes)
+
+def ocr_box_variants(img, read_fn, x1, y1, x2, y2, conf):
+    """OCR a box with raw / padded / deskewed crops — handles angled CCTV plates."""
+    candidates = []
+
+    def consider(crop, crop_box):
+        if crop is None or crop.size == 0:
+            return
+        text = best_ocr_text(read_fn, crop)
+        if text and not JUNK_OCR.search(text) and score_plate_text(text) > 0:
+            candidates.append((text, crop_box))
+
+    raw = img[y1:y2, x1:x2]
+    consider(raw, {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    consider(deskew_plate(raw), {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    crop, crop_box = extract_plate_crop(img, x1, y1, x2, y2)
+    consider(crop, crop_box)
+    consider(deskew_plate(crop) if crop is not None else None, crop_box)
+
+    if not any(PLATE_PATTERN.match(t) and len(t) >= 9 for t, _ in candidates):
+        wide_crop, wide_box = extract_plate_crop(
+            img, x1, y1, x2, y2, right_extra=CROP_RIGHT_EXTRA + 0.22
+        )
+        consider(wide_crop, wide_box)
+        consider(deskew_plate(wide_crop) if wide_crop is not None else None, wide_box)
+
+    if not candidates:
+        return None
+
+    text, crop_box = max(candidates, key=lambda item: score_plate_text(item[0]))
+    return {
+        "text": text,
+        "confidence": round(float(conf), 4),
+        "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "crop_box": crop_box,
+        "valid_format": bool(PLATE_PATTERN.match(text)),
+        "score": score_plate_text(text),
+    }
 
 
 def _extract_paddle_texts(result):
@@ -143,22 +438,99 @@ def _read_with_easy(reader, plate_img):
     return clean_plate_text("".join(res[1] for res in ocr_result))
 
 
+def _read_with_rapid(ocr, plate_img):
+    # Prefer recognition-only on tight crops; if multiple lines appear, pick the
+    # best plate-like string instead of concatenating IND/GPS junk.
+    result = ocr(plate_img, use_det=False, use_cls=False)
+    texts = []
+    if result is not None and result.txts:
+        texts.extend(result.txts)
+
+    if not texts or score_plate_text(clean_plate_text("".join(texts))) < 15:
+        det = ocr(plate_img, use_det=True, use_cls=False)
+        if det is not None and det.txts:
+            texts.extend(det.txts)
+
+    if not texts:
+        return ""
+
+    cleaned = [clean_plate_text(t) for t in texts]
+    cleaned = [t for t in cleaned if t and not JUNK_OCR.search(t)]
+    if not cleaned:
+        return ""
+    return max(cleaned, key=score_plate_text)
+
+
 def make_reader(engine="paddle"):
     """Return a callable that turns a plate crop into a cleaned text string."""
     ocr = get_ocr(engine)
-    if engine == "paddle":
-        return lambda crop: _read_with_paddle(ocr, crop)
-    return lambda crop: _read_with_easy(ocr, crop)
+    readers = {
+        "paddle": lambda crop: _read_with_paddle(ocr, crop),
+        "easy": lambda crop: _read_with_easy(ocr, crop),
+        "rapid": lambda crop: _read_with_rapid(ocr, crop),
+    }
+    return readers[engine]
 
 
 def best_ocr_text(read_fn, cropped_plate):
     """Read several renderings of the same crop and keep the best plate string."""
+    if cropped_plate is None or cropped_plate.size == 0:
+        return ""
     candidates = [
         read_fn(cropped_plate),
         read_fn(enhance_plate(cropped_plate, scale=2)),
-        read_fn(enhance_plate(cropped_plate, scale=4)),
     ]
     return max(candidates, key=score_plate_text)
+
+
+def scene_ocr_plates(img, engine="rapid"):
+    """Find plates by reading the middle of the frame (skips timestamp / GPS OSD).
+
+    Works well for angled CCTV cars where YOLO confuses GPS text with plates.
+    """
+    h, w = img.shape[:2]
+    y0, y1 = int(h * 0.12), int(h * 0.82)
+    mid = img[y0:y1, :]
+    ocr = get_ocr(engine if engine in OCR_ENGINES else "rapid")
+    try:
+        result = ocr(mid, use_det=True, use_cls=True)
+    except Exception:
+        return []
+
+    if result is None or not result.txts:
+        return []
+
+    scores = list(result.scores) if result.scores else [0.55] * len(result.txts)
+    boxes = list(result.boxes) if result.boxes is not None else [None] * len(result.txts)
+    found = []
+    for text, score, box in zip(result.txts, scores, boxes):
+        cleaned = clean_plate_text(str(text))
+        if not cleaned or JUNK_OCR.search(cleaned):
+            continue
+        text_score = score_plate_text(cleaned)
+        if text_score < 15:
+            continue
+
+        if box is not None:
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+            x1, x2 = int(max(0, min(xs))), int(min(w, max(xs)))
+            yy1, yy2 = int(max(0, min(ys) + y0)), int(min(h, max(ys) + y0))
+        else:
+            x1, yy1, x2, yy2 = 0, y0, w, y1
+
+        found.append(
+            {
+                "text": cleaned,
+                "confidence": round(float(score), 4),
+                "box": {"x1": x1, "y1": yy1, "x2": x2, "y2": yy2},
+                "crop_box": {"x1": x1, "y1": yy1, "x2": x2, "y2": yy2},
+                "valid_format": bool(PLATE_PATTERN.match(cleaned)),
+                "score": text_score,
+            }
+        )
+    found.sort(key=lambda p: (p["score"], p["confidence"]), reverse=True)
+    return found
 
 
 def read_plates(
@@ -171,38 +543,52 @@ def read_plates(
 ):
     """Detect plates in a BGR image and OCR each one.
 
-    Returns a list of dicts: text, confidence, box, valid_format.
-    Boxes whose text does not match the plate pattern are dropped unless
-    include_invalid is True.
+    Handles close-ups, night CCTV, and angled cars. Returns dicts with
+    text, confidence, box, crop_box, valid_format.
     """
     detector = get_detector(model_path)
     read_fn = make_reader(engine)
 
-    results = detector(img, conf=conf, imgsz=imgsz, verbose=False)
-
     plates = []
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-            crop = img[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
+    seen_text = set()
 
-            text = best_ocr_text(read_fn, crop)
-            valid = bool(PLATE_PATTERN.match(text))
-            if not valid and not include_invalid:
-                continue
+    # 1) Scene OCR on mid-frame — strongest for angled / distant CCTV plates.
+    for plate in scene_ocr_plates(img, engine=engine):
+        if not plate["valid_format"] and not include_invalid:
+            continue
+        if plate["text"] in seen_text:
+            continue
+        seen_text.add(plate["text"])
+        plates.append(plate)
 
-            plates.append(
-                {
-                    "text": text,
-                    "confidence": round(float(box.conf), 4),
-                    "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                    "valid_format": valid,
-                }
-            )
+    # Early return when scene OCR already found a solid Indian plate.
+    if any(p["valid_format"] and len(p["text"]) >= 9 for p in plates):
+        plates.sort(key=lambda p: (p["score"], p["confidence"]), reverse=True)
+        for plate in plates:
+            plate.pop("score", None)
+        return plates
 
-    plates.sort(key=lambda p: p["confidence"], reverse=True)
+    # 2) Fallback: color proposals + YOLO boxes (close-ups / hard crops).
+    boxes = color_plate_proposals(img)
+    for box in collect_detection_boxes(detector, img, conf=conf, imgsz=imgsz):
+        if any(_iou((box[1], box[2], box[3], box[4]), (b[1], b[2], b[3], b[4])) > 0.75 for b in boxes):
+            continue
+        boxes.append(box)
+
+    for det_conf, x1, y1, x2, y2 in boxes[:8]:
+        plate = ocr_box_variants(img, read_fn, x1, y1, x2, y2, det_conf)
+        if plate is None:
+            continue
+        if not plate["valid_format"] and not include_invalid:
+            continue
+        if plate["text"] in seen_text:
+            continue
+        seen_text.add(plate["text"])
+        plates.append(plate)
+
+    plates.sort(key=lambda p: (p["score"], p["confidence"]), reverse=True)
+    for plate in plates:
+        plate.pop("score", None)
     return plates
 
 
@@ -232,3 +618,137 @@ def encode_jpeg(img, quality=90):
     if not ok:
         raise RuntimeError("Failed to encode annotated image")
     return buffer.tobytes()
+
+
+def _dms_to_decimal(deg, minutes, seconds, hemi=""):
+    value = abs(float(deg)) + float(minutes) / 60.0 + float(seconds) / 3600.0
+    if hemi.upper() in ("S", "W"):
+        value = -value
+    return value
+
+
+def _parse_coord(text):
+    """Parse camera OSD latitude/longitude into decimal degrees."""
+    if not text:
+        return None
+    raw = text.upper().replace(" ", "")
+
+    dms = re.search(
+        r"(\d{1,3})[°º\s]+(\d{1,2})['′\s]+(\d{1,2}(?:\.\d+)?)[\"″]?\s*([NSEW])?",
+        text,
+        re.I,
+    )
+    if dms:
+        hemi = dms.group(4) or ""
+        if not hemi:
+            if "LAT" in raw and "S" in raw:
+                hemi = "S"
+            elif "LON" in raw and "W" in raw:
+                hemi = "W"
+            elif "LAT" in raw:
+                hemi = "N"
+            elif "LON" in raw:
+                hemi = "E"
+        return _dms_to_decimal(dms.group(1), dms.group(2), dms.group(3), hemi)
+
+    dec = re.search(r"(-?\d{1,3}\.\d+)\s*([NSEW])?", text)
+    if dec:
+        value = float(dec.group(1))
+        hemi = (dec.group(2) or "").upper()
+        if hemi in ("S", "W"):
+            value = -abs(value)
+        return value
+    return None
+
+
+def _parse_overlay_datetime(text):
+    """Parse common CCTV timestamp styles into DD/MM/YYYY HH:MM:SS."""
+    patterns = [
+        (r"(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2}):(\d{2})", "ymd"),
+        (r"(\d{2})[-/](\d{2})[-/](\d{4})[ T](\d{2}):(\d{2}):(\d{2})", "dmy"),
+    ]
+    for pattern, order in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        a, b, c, hh, mm, ss = match.groups()
+        if order == "ymd":
+            yyyy, mo, dd = a, b, c
+        else:
+            dd, mo, yyyy = a, b, c
+        return f"{dd}/{mo}/{yyyy} {hh}:{mm}:{ss}"
+    return None
+
+
+def extract_camera_overlay(img, engine="rapid"):
+    """Read GPS + timestamp from CCTV OSD bands (top / bottom of the frame)."""
+    h, w = img.shape[:2]
+    bands = [
+        img[0 : max(int(h * 0.16), 40), :],
+        img[max(h - int(h * 0.22), 0) : h, :],
+    ]
+
+    ocr = get_ocr(engine if engine in OCR_ENGINES else "rapid")
+    lines = []
+    for band in bands:
+        try:
+            result = ocr(band, use_det=True, use_cls=False)
+        except Exception:
+            continue
+        if result is None or not result.txts:
+            continue
+        lines.extend(str(t) for t in result.txts if t)
+
+    latitude = ""
+    longitude = ""
+    date_time = ""
+    joined = " | ".join(lines)
+
+    for line in lines:
+        upper = line.upper()
+        if "LAT" in upper and not latitude:
+            value = _parse_coord(line)
+            if value is not None:
+                latitude = f"{value:.2f}"
+        if ("LON" in upper or "LONG" in upper) and not longitude:
+            value = _parse_coord(line)
+            if value is not None:
+                longitude = f"{value:.2f}"
+        if not date_time:
+            parsed = _parse_overlay_datetime(line)
+            if parsed:
+                date_time = parsed
+
+    if not date_time:
+        parsed = _parse_overlay_datetime(joined)
+        if parsed:
+            date_time = parsed
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "date_time": date_time,
+        "overlay_text": lines,
+    }
+
+
+def format_client_payload(plates, overlay=None, now=None):
+    """Client response shape: Plate_Number, lat/long, confidence%, date_time."""
+    from datetime import datetime
+
+    overlay = overlay or {}
+    valid = [p for p in plates if p.get("valid_format")]
+    best = valid[0] if valid else None
+    plate_number = best["text"] if best else ""
+    confidence = f"{best['confidence'] * 100:.2f}%" if best else "0.00%"
+    date_time = overlay.get("date_time") or (now or datetime.now()).strftime(
+        "%d/%m/%Y %H:%M:%S"
+    )
+
+    return {
+        "Plate_Number": plate_number,
+        "latitude": overlay.get("latitude") or "",
+        "longitude": overlay.get("longitude") or "",
+        "confidence": confidence,
+        "date_time": date_time,
+    }

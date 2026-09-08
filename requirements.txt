@@ -4,6 +4,8 @@ opencv-python
 numpy
 paddlepaddle
 paddleocr
+rapidocr
+onnxruntime
 
 # API
 fastapi

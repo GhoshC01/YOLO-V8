@@ -2,18 +2,23 @@
 
 import base64
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 
+import detection_store
 import plate_reader
 
 ROOT = Path(__file__).resolve().parent
 UI_FILE = ROOT / "static" / "index.html"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+detection_store.ensure_storage_dir()
 
 app = FastAPI(
     title="Number Plate Detector API",
@@ -47,11 +52,39 @@ def _load_image(upload: UploadFile, data: bytes):
     return img
 
 
+def _build_client_result(
+    img,
+    plates,
+    ocr_engine,
+    latitude="",
+    longitude="",
+    date_time="",
+):
+    overlay = plate_reader.extract_camera_overlay(img, engine=ocr_engine)
+    if latitude:
+        overlay["latitude"] = latitude
+    if longitude:
+        overlay["longitude"] = longitude
+    if date_time:
+        overlay["date_time"] = date_time
+    return plate_reader.format_client_payload(
+        plates, overlay=overlay, now=datetime.now()
+    )
+
+
 @app.on_event("startup")
 def warm_up_models():
     """Load YOLO + OCR at boot so the first request is not slow."""
+    detection_store.ensure_storage_dir()
     plate_reader.get_detector()
-    plate_reader.make_reader("paddle")
+    plate_reader.make_reader("rapid")
+
+
+app.mount(
+    "/detections",
+    StaticFiles(directory=str(detection_store.STORAGE_DIR)),
+    name="detections",
+)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -63,7 +96,19 @@ def upload_page():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": plate_reader.DEFAULT_MODEL}
+    return {
+        "status": "ok",
+        "model": plate_reader.DEFAULT_MODEL,
+        "storage_dir": str(detection_store.STORAGE_DIR),
+        "ocr_engines": list(plate_reader.OCR_ENGINES),
+    }
+
+
+@app.get("/detections/list")
+def detections_list(limit: int = 50):
+    """List recent saved detections for client demos."""
+    items = detection_store.list_detections(limit=limit)
+    return {"count": len(items), "items": items}
 
 
 @app.post("/detect")
@@ -71,23 +116,36 @@ async def detect(
     files: List[UploadFile] = File(..., description="One or more images of any format"),
     conf: float = Form(plate_reader.DEFAULT_CONF),
     imgsz: int = Form(plate_reader.DEFAULT_IMGSZ),
-    ocr: str = Form("paddle"),
+    ocr: str = Form("rapid"),
     include_invalid: bool = Form(False),
     annotate: bool = Form(False),
+    save: bool = Form(True),
+    latitude: str = Form(""),
+    longitude: str = Form(""),
+    date_time: str = Form(""),
 ):
-    """Detect and read number plates in the uploaded images.
+    """Detect plates and return client payload.
 
-    Set annotate=true to also receive the boxed image as a base64 JPEG.
+    Response shape (single image):
+    {
+      "Plate_Number": "MH46AF1865",
+      "latitude": "21.13",
+      "longitude": "79.70",
+      "confidence": "58.23%",
+      "date_time": "03/09/2026 13:08:03"
+    }
     """
-    if ocr not in ("paddle", "easy"):
-        raise HTTPException(status_code=400, detail="ocr must be 'paddle' or 'easy'.")
+    if ocr not in plate_reader.OCR_ENGINES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ocr must be one of: {', '.join(plate_reader.OCR_ENGINES)}.",
+        )
 
-    results = []
+    payloads = []
     for upload in files:
         data = await upload.read()
         img = _load_image(upload, data)
 
-        started = time.perf_counter()
         plates = plate_reader.read_plates(
             img,
             conf=conf,
@@ -95,28 +153,29 @@ async def detect(
             engine=ocr,
             include_invalid=include_invalid,
         )
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        payload = _build_client_result(
+            img,
+            plates,
+            ocr_engine=ocr,
+            latitude=latitude,
+            longitude=longitude,
+            date_time=date_time,
+        )
 
-        entry = {
-            "filename": upload.filename,
-            "width": img.shape[1],
-            "height": img.shape[0],
-            "plate_count": len(plates),
-            "plates": plates,
-            "best_plate": plates[0]["text"] if plates else None,
-            "processing_ms": elapsed_ms,
-        }
+        if save:
+            detection_store.save_detection(img, plates, upload.filename)
 
         if annotate:
             annotated = plate_reader.annotate(img, plates)
             jpeg = plate_reader.encode_jpeg(annotated)
-            entry["annotated_image"] = (
+            payload["annotated_image"] = (
                 "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
             )
 
-        results.append(entry)
+        payloads.append(payload)
 
-    return {"count": len(results), "results": results}
+    # One image → exact client object. Multiple → list of those objects.
+    return payloads[0] if len(payloads) == 1 else payloads
 
 
 @app.post("/detect/image")
@@ -124,8 +183,9 @@ async def detect_image(
     file: UploadFile = File(..., description="A single image of any format"),
     conf: float = Form(plate_reader.DEFAULT_CONF),
     imgsz: int = Form(plate_reader.DEFAULT_IMGSZ),
-    ocr: str = Form("paddle"),
+    ocr: str = Form("rapid"),
     include_invalid: bool = Form(False),
+    save: bool = Form(True),
 ):
     """Same as /detect but responds with the annotated JPEG itself."""
     data = await file.read()
@@ -139,15 +199,21 @@ async def detect_image(
         include_invalid=include_invalid,
     )
     annotated = plate_reader.annotate(img, plates)
+    headers = {"X-Plates": ",".join(p["text"] for p in plates) or "none"}
+
+    if save:
+        saved = detection_store.save_detection(img, plates, file.filename)
+        headers["X-Saved-Url"] = saved["annotated_url"]
+        headers["X-Saved-Id"] = saved["id"]
 
     return Response(
         content=plate_reader.encode_jpeg(annotated),
         media_type="image/jpeg",
-        headers={"X-Plates": ",".join(p["text"] for p in plates) or "none"},
+        headers=headers,
     )
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("api:app", host="0.0.0.0", port=9000, reload=False)

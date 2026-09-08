@@ -15,6 +15,7 @@ weights/
 # Local test media & results
 test_car.jpg
 output_result.jpg
+tmp_detections/
 *.mp4
 
 # Dataset images (keep data.yaml template only if you want)

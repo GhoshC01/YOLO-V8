@@ -108,13 +108,13 @@
 <div class="wrap">
   <header>
     <h1>Number Plate Detector</h1>
-    <div class="sub">YOLOv8 + PaddleOCR &middot; JPG, PNG, WebP, BMP, TIFF, HEIC সব চলবে</div>
+    <div class="sub">YOLOv8 + PaddleOCR &middot; JPG, PNG, WebP, BMP, TIFF, HEIC supported</div>
   </header>
 
   <div class="card">
     <div id="drop">
-      <div class="big">ছবি এখানে ড্রপ করুন বা ক্লিক করে সিলেক্ট করুন</div>
-      <div class="small">একসাথে একাধিক ছবি দিতে পারবেন &middot; সর্বোচ্চ 25 MB প্রতি ছবি</div>
+      <div class="big">Drop images here or click to select</div>
+      <div class="small">You can upload multiple images &middot; up to 25 MB per image</div>
     </div>
     <input id="picker" type="file" accept="image/*,.heic,.heif" multiple />
     <div class="files" id="filelist"></div>
@@ -123,7 +123,8 @@
       <div class="field">
         <label for="ocr">OCR engine</label>
         <select id="ocr">
-          <option value="paddle" selected>PaddleOCR</option>
+          <option value="rapid" selected>RapidOCR (fast)</option>
+          <option value="paddle">PaddleOCR</option>
           <option value="easy">EasyOCR</option>
         </select>
       </div>
@@ -189,7 +190,7 @@
 
     go.disabled = true;
     results.innerHTML = '';
-    statusBox.innerHTML = '<div class="card spin">Processing… প্রথমবার মডেল লোড হতে কিছুটা সময় লাগতে পারে।</div>';
+    statusBox.innerHTML = '<div class="card spin">Processing… the first request may take a moment while models load.</div>';
 
     try {
       const res = await fetch('/detect', { method: 'POST', body });
@@ -198,8 +199,9 @@
         throw new Error(err.detail || 'Request failed');
       }
       const data = await res.json();
+      const items = Array.isArray(data) ? data : [data];
       statusBox.innerHTML = '';
-      results.innerHTML = data.results.map(render).join('');
+      results.innerHTML = items.map(render).join('');
     } catch (err) {
       statusBox.innerHTML = `<div class="card none">Error: ${err.message}</div>`;
     } finally {
@@ -208,25 +210,19 @@
   });
 
   function render(r) {
-    const plates = r.plates.length
-      ? r.plates.map(p =>
-          `<span class="plate ${p.valid_format ? '' : 'invalid'}">${p.text || '—'}</span>`
-        ).join('')
-      : '<div class="none">কোনো নম্বর প্লেট পাওয়া যায়নি। Confidence কমিয়ে বা Image size বাড়িয়ে দেখুন।</div>';
-
-    const conf = r.plates.length
-      ? r.plates.map(p => `${p.text}: ${(p.confidence * 100).toFixed(0)}%`).join(' · ')
-      : '';
+    const plate = r.Plate_Number
+      ? `<span class="plate">${r.Plate_Number}</span>`
+      : '<div class="none">No license plate found. Try lowering confidence or increasing image size.</div>';
 
     return `
       <div class="result">
         ${r.annotated_image ? `<img src="${r.annotated_image}" alt="result" />` : ''}
         <div class="body">
-          <div class="fname">${r.filename}</div>
-          ${plates}
+          ${plate}
           <div class="meta">
-            ${r.width}×${r.height} px · ${r.plate_count} plate(s) · ${r.processing_ms} ms
-            ${conf ? '<br>Detection confidence — ' + conf : ''}
+            Confidence — ${r.confidence || '—'}<br>
+            Lat ${r.latitude || '—'} · Lon ${r.longitude || '—'}<br>
+            ${r.date_time || ''}
           </div>
         </div>
       </div>`;

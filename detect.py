@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 
+import detection_store
 import plate_reader
 
 
@@ -42,7 +43,7 @@ def parse_args():
     )
     parser.add_argument(
         "--ocr",
-        choices=["paddle", "easy"],
+        choices=["paddle", "easy", "rapid"],
         default="paddle",
         help="OCR engine (default: paddle)",
     )
@@ -59,12 +60,12 @@ def main():
 
     data = Path(args.image)
     if not data.exists():
-        print(f"Error: '{args.image}' ছবিটি খুঁজে পাওয়া যায়নি!")
+        print(f"Error: image '{args.image}' not found!")
         sys.exit(1)
 
     img = plate_reader.decode_image(data.read_bytes())
     if img is None:
-        print(f"Error: '{args.image}' পড়া যায়নি — ফরম্যাট সাপোর্টেড নয়।")
+        print(f"Error: could not read '{args.image}' — unsupported image format.")
         sys.exit(1)
 
     plates = plate_reader.read_plates(
@@ -89,6 +90,10 @@ def main():
 
     cv2.imwrite(args.output, plate_reader.annotate(img, plates))
     print(f"Result saved as '{args.output}'")
+
+    saved = detection_store.save_detection(img, plates, data.name)
+    print(f"Demo folder : tmp_detections/{saved['folder']}")
+    print(f"Annotated   : tmp_detections/{saved['folder']}/annotated.jpg")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,16 @@ names: ['indian_licence_plate']
         imgsz=640,
         batch=16,
         name="my_plate_model",
+
+        # --- Advanced Augmentation for Diverse Fonts & Styles ---
+        degrees=15,       # rotation of the font
+        perspective=0.001, # different angles of the license plate
+        shear=10,         # italic font style
+        scale=0.5,        # size of the font
+        hsv_h=0.015,      # multiple colors of the license plate (yellow, green, white)
+        hsv_s=0.7,
+        hsv_v=0.4
+        
     )
 
 
