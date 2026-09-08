@@ -14,7 +14,14 @@ DEFAULT_IMGSZ = 1280
 OCR_ENGINES = ("paddle", "easy", "rapid")
 
 PLATE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-PLATE_PATTERN = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$")
+# Standard: MH12AB1234. Also series-less UT plates: LA020749 / LA 02 0749.
+PLATE_PATTERN = re.compile(
+    r"^[A-Z]{2}\d{1,2}(?:[A-Z]{1,3}\d{1,4}|\d{3,4})$"
+)
+# Two-line commercial / auto plates: "AP13" above "V7951"
+PLATE_LINE_TOP = re.compile(r"^[A-Z]{2}\d{1,2}$")
+PLATE_LINE_BOTTOM = re.compile(r"^[A-Z]{0,3}\d{1,4}$")
+MIN_READ_SIDE = 480
 
 CROP_SIDE_PAD = 0.12
 CROP_RIGHT_EXTRA = 0.18
@@ -108,6 +115,46 @@ def clean_plate_text(text):
     return cleaned
 
 
+def normalize_plate_candidate(text):
+    """Clean OCR text and drop trailing bumper/hologram junk if needed."""
+    cleaned = clean_plate_text(text)
+    if not cleaned:
+        return ""
+    if PLATE_PATTERN.match(cleaned):
+        return cleaned
+    # Extra trailing char(s) from IND strip / reflector (e.g. LA020749C).
+    for trim in range(1, 3):
+        if len(cleaned) > trim and PLATE_PATTERN.match(cleaned[:-trim]):
+            return cleaned[:-trim]
+    return cleaned
+
+
+def merge_plate_line_texts(texts):
+    """Combine OCR lines from two-line Indian plates into one string.
+
+    Auto / commercial plates often read as separate lines (AP13 + V7951).
+    Prefer a joined candidate when it matches the plate pattern.
+    """
+    cleaned = []
+    for text in texts:
+        value = normalize_plate_candidate(str(text))
+        if value and not JUNK_OCR.search(value):
+            cleaned.append(value)
+    if not cleaned:
+        return ""
+
+    candidates = list(cleaned)
+    candidates.append(normalize_plate_candidate("".join(cleaned)))
+    for i, top in enumerate(cleaned):
+        for j, bottom in enumerate(cleaned):
+            if i == j:
+                continue
+            if PLATE_LINE_TOP.match(top) and PLATE_LINE_BOTTOM.match(bottom):
+                candidates.append(normalize_plate_candidate(top + bottom))
+
+    return max(candidates, key=score_plate_text)
+
+
 def score_plate_text(text):
     """Prefer typical Indian plate length / pattern."""
     if not text:
@@ -118,13 +165,13 @@ def score_plate_text(text):
     digit_ratio = sum(ch.isdigit() for ch in text) / max(len(text), 1)
     if digit_ratio > 0.7 and not PLATE_PATTERN.match(text):
         return -3
-    if text.endswith(("E", "N", "W", "S")) and digit_ratio > 0.5:
+    if text.endswith(("E", "N", "W", "S")) and digit_ratio > 0.5 and not PLATE_PATTERN.match(text):
         return -4
 
     score = len(text)
-    if 8 <= len(text) <= 11:
+    if 7 <= len(text) <= 11:
         score += 5
-    if 9 <= len(text) <= 10:
+    if 8 <= len(text) <= 10:
         score += 3
     if PLATE_PATTERN.match(text):
         score += 20
@@ -132,6 +179,22 @@ def score_plate_text(text):
     if re.match(r"^[A-Z]{2}\d", text):
         score += 8
     return score
+
+
+def ensure_min_read_size(img):
+    """Upscale tiny uploads so YOLO/OCR can resolve two-line plates."""
+    if img is None or img.size == 0:
+        return img, 1.0
+    h, w = img.shape[:2]
+    scale = max(MIN_READ_SIDE / max(h, 1), MIN_READ_SIDE / max(w, 1), 1.0)
+    if scale <= 1.05:
+        return img, 1.0
+    resized = cv2.resize(
+        img,
+        (max(int(w * scale), 1), max(int(h * scale), 1)),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    return resized, scale
 
 
 def enhance_plate(cropped_plate, scale=2):
@@ -295,7 +358,7 @@ def collect_detection_boxes(detector, img, conf, imgsz):
         conf_i, x1, y1, x2, y2 = item
         ar = _box_aspect(x1, y1, x2, y2)
         cy = (y1 + y2) / 2.0 / img_h
-        aspect_score = 1.0 if 1.8 <= ar <= 6.0 else 0.2
+        aspect_score = 1.0 if 0.7 <= ar <= 6.0 else 0.2
         band_score = 1.0 if 0.25 <= cy <= 0.85 else 0.3
         return (aspect_score + band_score, conf_i)
 
@@ -322,7 +385,8 @@ def _mask_to_proposals(img, mask, score=0.34, max_boxes=3):
         if w < 60 or h < 18:
             continue
         ar = w / max(h, 1)
-        if ar < 1.5 or ar > 8.0:
+        # Single-line plates are wide; two-line auto plates are nearer square.
+        if ar < 0.7 or ar > 8.0:
             continue
         if (w * h) < (img_w * img_h * 0.008):
             continue
@@ -383,7 +447,7 @@ def ocr_box_variants(img, read_fn, x1, y1, x2, y2, conf):
     consider(crop, crop_box)
     consider(deskew_plate(crop) if crop is not None else None, crop_box)
 
-    if not any(PLATE_PATTERN.match(t) and len(t) >= 9 for t, _ in candidates):
+    if not any(PLATE_PATTERN.match(t) and len(t) >= 7 for t, _ in candidates):
         wide_crop, wide_box = extract_plate_crop(
             img, x1, y1, x2, y2, right_extra=CROP_RIGHT_EXTRA + 0.22
         )
@@ -425,7 +489,7 @@ def _extract_paddle_texts(result):
 
 def _read_with_paddle(ocr, plate_img):
     result = ocr.predict(plate_img) if hasattr(ocr, "predict") else ocr.ocr(plate_img)
-    return clean_plate_text("".join(_extract_paddle_texts(result)))
+    return merge_plate_line_texts(_extract_paddle_texts(result))
 
 
 def _read_with_easy(reader, plate_img):
@@ -435,30 +499,26 @@ def _read_with_easy(reader, plate_img):
         detail=1,
         paragraph=False,
     )
-    return clean_plate_text("".join(res[1] for res in ocr_result))
+    return merge_plate_line_texts([res[1] for res in ocr_result])
 
 
 def _read_with_rapid(ocr, plate_img):
-    # Prefer recognition-only on tight crops; if multiple lines appear, pick the
-    # best plate-like string instead of concatenating IND/GPS junk.
-    result = ocr(plate_img, use_det=False, use_cls=False)
+    # Detection-first for two-line plates (AP13 / V7951). Recognition-only often
+    # collapses both lines into one garbled string on small crops.
     texts = []
+    det = ocr(plate_img, use_det=True, use_cls=False)
+    if det is not None and det.txts:
+        texts.extend(det.txts)
+
+    merged = merge_plate_line_texts(texts)
+    if PLATE_PATTERN.match(merged):
+        return merged
+
+    result = ocr(plate_img, use_det=False, use_cls=False)
     if result is not None and result.txts:
         texts.extend(result.txts)
 
-    if not texts or score_plate_text(clean_plate_text("".join(texts))) < 15:
-        det = ocr(plate_img, use_det=True, use_cls=False)
-        if det is not None and det.txts:
-            texts.extend(det.txts)
-
-    if not texts:
-        return ""
-
-    cleaned = [clean_plate_text(t) for t in texts]
-    cleaned = [t for t in cleaned if t and not JUNK_OCR.search(t)]
-    if not cleaned:
-        return ""
-    return max(cleaned, key=score_plate_text)
+    return merge_plate_line_texts(texts)
 
 
 def make_reader(engine="paddle"):
@@ -487,6 +547,7 @@ def scene_ocr_plates(img, engine="rapid"):
     """Find plates by reading the middle of the frame (skips timestamp / GPS OSD).
 
     Works well for angled CCTV cars where YOLO confuses GPS text with plates.
+    Also merges stacked two-line plate fragments into one plate string.
     """
     h, w = img.shape[:2]
     y0, y1 = int(h * 0.12), int(h * 0.82)
@@ -502,13 +563,10 @@ def scene_ocr_plates(img, engine="rapid"):
 
     scores = list(result.scores) if result.scores else [0.55] * len(result.txts)
     boxes = list(result.boxes) if result.boxes is not None else [None] * len(result.txts)
-    found = []
+    fragments = []
     for text, score, box in zip(result.txts, scores, boxes):
-        cleaned = clean_plate_text(str(text))
+        cleaned = normalize_plate_candidate(str(text))
         if not cleaned or JUNK_OCR.search(cleaned):
-            continue
-        text_score = score_plate_text(cleaned)
-        if text_score < 15:
             continue
 
         if box is not None:
@@ -519,16 +577,75 @@ def scene_ocr_plates(img, engine="rapid"):
         else:
             x1, yy1, x2, yy2 = 0, y0, w, y1
 
-        found.append(
+        fragments.append(
             {
                 "text": cleaned,
                 "confidence": round(float(score), 4),
                 "box": {"x1": x1, "y1": yy1, "x2": x2, "y2": yy2},
-                "crop_box": {"x1": x1, "y1": yy1, "x2": x2, "y2": yy2},
-                "valid_format": bool(PLATE_PATTERN.match(cleaned)),
+                "cy": (yy1 + yy2) / 2.0,
+            }
+        )
+
+    found = []
+    used = set()
+    fragments.sort(key=lambda f: f["cy"])
+    for i, top in enumerate(fragments):
+        if i in used:
+            continue
+        merged = None
+        for j, bottom in enumerate(fragments):
+            if i == j or j in used:
+                continue
+            if bottom["cy"] <= top["cy"]:
+                continue
+            # Same vertical stack (two-line plate), not distant captions.
+            if abs(
+                ((top["box"]["x1"] + top["box"]["x2"]) / 2.0)
+                - ((bottom["box"]["x1"] + bottom["box"]["x2"]) / 2.0)
+            ) > max(w * 0.25, 40):
+                continue
+            if bottom["cy"] - top["cy"] > h * 0.35:
+                continue
+            candidate = merge_plate_line_texts([top["text"], bottom["text"]])
+            if PLATE_PATTERN.match(candidate):
+                merged = (candidate, top, bottom, j)
+                break
+        if merged:
+            text, a, b, j = merged
+            used.add(i)
+            used.add(j)
+            x1 = min(a["box"]["x1"], b["box"]["x1"])
+            y1 = min(a["box"]["y1"], b["box"]["y1"])
+            x2 = max(a["box"]["x2"], b["box"]["x2"])
+            y2 = max(a["box"]["y2"], b["box"]["y2"])
+            found.append(
+                {
+                    "text": text,
+                    "confidence": round((a["confidence"] + b["confidence"]) / 2.0, 4),
+                    "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "crop_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "valid_format": True,
+                    "score": score_plate_text(text),
+                }
+            )
+
+    for index, frag in enumerate(fragments):
+        if index in used:
+            continue
+        text_score = score_plate_text(frag["text"])
+        if text_score < 15 and not PLATE_PATTERN.match(frag["text"]):
+            continue
+        found.append(
+            {
+                "text": frag["text"],
+                "confidence": frag["confidence"],
+                "box": frag["box"],
+                "crop_box": frag["box"],
+                "valid_format": bool(PLATE_PATTERN.match(frag["text"])),
                 "score": text_score,
             }
         )
+
     found.sort(key=lambda p: (p["score"], p["confidence"]), reverse=True)
     return found
 
@@ -548,6 +665,7 @@ def read_plates(
     """
     detector = get_detector(model_path)
     read_fn = make_reader(engine)
+    img, _ = ensure_min_read_size(img)
 
     plates = []
     seen_text = set()
@@ -562,7 +680,7 @@ def read_plates(
         plates.append(plate)
 
     # Early return when scene OCR already found a solid Indian plate.
-    if any(p["valid_format"] and len(p["text"]) >= 9 for p in plates):
+    if any(p["valid_format"] and len(p["text"]) >= 7 for p in plates):
         plates.sort(key=lambda p: (p["score"], p["confidence"]), reverse=True)
         for plate in plates:
             plate.pop("score", None)
